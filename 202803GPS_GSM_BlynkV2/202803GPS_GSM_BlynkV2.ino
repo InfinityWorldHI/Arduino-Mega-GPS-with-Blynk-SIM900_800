@@ -72,6 +72,212 @@ bool gprsInit();
 bool gprsConnect();
 bool gprsDisconnect();
 //***********************************************************
+typedef const __FlashStringHelper* GsmConstStr;
+//***********************************************************
+void sendAT(const String& cmd) {
+  stream1->print("AT");
+  stream1->println(cmd);
+}
+//***********************************************************
+uint8_t waitResponse(uint32_t timeout, GsmConstStr r1,
+                     GsmConstStr r2 = NULL, GsmConstStr r3 = NULL) {
+  String data;
+  data.reserve(64);
+  int index = 0;
+  for (unsigned long start = millis(); millis() - start < timeout; ) {
+    while (stream1->available() > 0) {
+      int c = stream1->read();
+      if (c < 0) continue;
+      data += (char)c;
+      if (data.indexOf(r1) >= 0) {
+        index = 1;
+        goto finish;
+      } else if (r2 && data.indexOf(r2) >= 0) {
+        index = 2;
+        goto finish;
+      } else if (r3 && data.indexOf(r3) >= 0) {
+        index = 3;
+        goto finish;
+      }
+    }
+  }
+finish:
+  return index;
+}
+//***********************************************************
+uint8_t waitResponse(GsmConstStr r1,
+                     GsmConstStr r2 = NULL, GsmConstStr r3 = NULL){
+  return waitResponse(1000, r1, r2, r3);
+}
+//***********************************************************
+uint8_t waitOK_ERROR(uint32_t timeout = 2000) {
+  return waitResponse(timeout, F("OK\r\n"), F("ERROR\r\n"));
+}
+//***********************************************************
+void send_SMS(){
+  stream1->println("AT+CMGF=1");    //Sets the GSM Module in Text Mode
+  waitOK_ERROR();
+  for(int i=0; i<4; i++){
+    Serial.println ("Set SMS Number to: " + number[i]);
+    stream1->println("AT+CMGS=\"" + number[i] + "\""); //Mobile phone number to send message
+    delay(1000);
+    stream1->print(Message);
+    delay(1000);
+    stream1->write(26);
+    waitOK_ERROR();
+
+    delay(2000);
+  }
+}
+//***********************************************************
+bool gprsInit() {
+  Serial.print("GPRS init: ");
+  sendAT(F("E0"));
+  waitOK_ERROR();
+
+  sendAT(F("+SAPBR=3,1,\"Contype\",\"GPRS\""));
+  waitOK_ERROR();
+
+  sendAT(F("+SAPBR=3,1,\"APN\",\"" GPRS_APN "\""));
+  waitOK_ERROR();
+
+#ifdef GPRS_USER
+  sendAT(F("+SAPBR=3,1,\"USER\",\"" GPRS_USER "\""));
+  waitOK_ERROR();
+#endif
+#ifdef GPRS_PASSWORD
+  sendAT(F("+SAPBR=3,1,\"PWD\",\"" GPRS_PASSWORD "\""));
+  waitOK_ERROR();
+#endif
+
+  sendAT(F("+CGDCONT=1,\"IP\",\"" GPRS_APN "\""));
+  waitOK_ERROR();
+  return true;
+}
+//***********************************************************
+// Start the GSM connection
+bool gprsConnect() {
+  
+  Serial.println("Connecting to GSM...");
+
+  sendAT(F("+CGACT=1,1"));
+  waitOK_ERROR(60000L);
+
+  // Open a GPRS context
+  sendAT(F("+SAPBR=1,1"));
+  waitOK_ERROR(85000L);
+  // Query the GPRS context
+  sendAT(F("+SAPBR=2,1"));
+  if (waitOK_ERROR(30000L) != 1)
+    return false;
+
+  Serial.println("GSM connected");
+  return true;
+}
+//***********************************************************
+bool gprsDisconnect() {
+  sendAT(F("+SAPBR=0,1"));
+  if (waitOK_ERROR(30000L) != 1)
+    return;
+
+  sendAT(F("+CGACT=0"));
+  waitOK_ERROR(60000L);
+
+  Serial.println("GSM disconnected");
+  return true;
+}
+//***********************************************************
+int httpRequest(const String& method,
+                const String& url,
+                const String& request,
+                String&       response)
+{
+  Serial.print(F("  Request: "));
+  Serial.print(host);
+  Serial.println(url);
+
+  sendAT(F("+HTTPTERM"));
+  waitOK_ERROR();
+
+  sendAT(F("+HTTPINIT"));
+  waitOK_ERROR();
+
+  sendAT(F("+HTTPPARA=\"CID\",1"));
+  waitOK_ERROR();
+
+#ifdef USE_HTTPS
+  sendAT(F("+HTTPSSL=1"));
+  waitOK_ERROR();
+  sendAT(String(F("+HTTPPARA=\"URL\",\"https://")) + host + url + "\"");
+  waitOK_ERROR();
+#else
+  sendAT(String(F("+HTTPPARA=\"URL\",\"")) + host + url + "\"");
+  waitOK_ERROR();
+#endif
+
+  if (request.length()) {
+    sendAT(F("+HTTPPARA=\"CONTENT\",\"application/json\""));
+    waitOK_ERROR();
+    sendAT(String(F("+HTTPDATA=")) + request.length() + "," + 10000);
+    waitResponse(F("DOWNLOAD\r\n"));
+    stream1->print(request);
+    waitOK_ERROR();
+  }
+
+  if (method == "GET") {
+    sendAT(F("+HTTPACTION=0"));
+  } else if (method == "POST") {
+    sendAT(F("+HTTPACTION=1"));
+  } else if (method == "HEAD") {
+    sendAT(F("+HTTPACTION=2"));
+  } else if (method == "DELETE") {
+    sendAT(F("+HTTPACTION=3"));
+  }
+  waitOK_ERROR();
+
+  if (waitResponse(30000L, F("+HTTPACTION:")) != 1) {
+    Serial.println("HTTPACTION Timeout");
+    return false;
+  }
+  stream1->readStringUntil(',');
+  int code = stream1->readStringUntil(',').toInt();
+  size_t len = stream1->readStringUntil('\n').toInt();
+
+  if (code != 200) {
+    Serial.print("Error code:");
+    Serial.println(code);
+    sendAT(F("+HTTPTERM"));
+    waitOK_ERROR();
+    return false;
+  }
+
+  response = "";
+
+  if (len > 0) {
+    response.reserve(len);
+
+    sendAT(F("+HTTPREAD"));
+    if (waitResponse(10000L, F("+HTTPREAD: ")) != 1) {
+      Serial.println("HTTPREAD Timeout");
+      return false;
+    }
+    len = stream1->readStringUntil('\n').toInt();
+
+    while (len--) {
+      while (!stream1->available()) {
+        delay(1);
+      }
+      response += (char)(stream1->read());
+    }
+    waitOK_ERROR();
+  }
+
+  sendAT(F("+HTTPTERM"));
+  waitOK_ERROR();
+
+  return true;
+}
+//***********************************************************
 void CheckBattery(){
   busvoltage = 0;
   float shuntvoltage = 0;
@@ -318,6 +524,13 @@ void check_SMS(){
       }
     }
   }
+  
+  Serial.println("GSM Deep Sleep");
+  stream1->println("AT");
+  waitOK_ERROR();
+  stream1->println("AT+CSCLK=2");
+  waitOK_ERROR();
+  
 }
 //***********************************************************
 void setup(){
@@ -355,211 +568,5 @@ void loop(){
     CheckBattery();
   }
   
-}
-//***********************************************************
-typedef const __FlashStringHelper* GsmConstStr;
-//***********************************************************
-void sendAT(const String& cmd) {
-  stream1->print("AT");
-  stream1->println(cmd);
-}
-//***********************************************************
-uint8_t waitResponse(uint32_t timeout, GsmConstStr r1,
-                     GsmConstStr r2 = NULL, GsmConstStr r3 = NULL) {
-  String data;
-  data.reserve(64);
-  int index = 0;
-  for (unsigned long start = millis(); millis() - start < timeout; ) {
-    while (stream1->available() > 0) {
-      int c = stream1->read();
-      if (c < 0) continue;
-      data += (char)c;
-      if (data.indexOf(r1) >= 0) {
-        index = 1;
-        goto finish;
-      } else if (r2 && data.indexOf(r2) >= 0) {
-        index = 2;
-        goto finish;
-      } else if (r3 && data.indexOf(r3) >= 0) {
-        index = 3;
-        goto finish;
-      }
-    }
-  }
-finish:
-  return index;
-}
-//***********************************************************
-uint8_t waitResponse(GsmConstStr r1,
-                     GsmConstStr r2 = NULL, GsmConstStr r3 = NULL){
-  return waitResponse(1000, r1, r2, r3);
-}
-//***********************************************************
-uint8_t waitOK_ERROR(uint32_t timeout = 2000) {
-  return waitResponse(timeout, F("OK\r\n"), F("ERROR\r\n"));
-}
-//***********************************************************
-void send_SMS(){
-  stream1->println("AT+CMGF=1");    //Sets the GSM Module in Text Mode
-  waitOK_ERROR();
-  for(int i=0; i<4; i++){
-    Serial.println ("Set SMS Number to: " + number[i]);
-    stream1->println("AT+CMGS=\"" + number[i] + "\""); //Mobile phone number to send message
-    delay(1000);
-    stream1->print(Message);
-    delay(1000);
-    stream1->write(26);
-    waitOK_ERROR();
-
-    delay(2000);
-  }
-}
-//***********************************************************
-bool gprsInit() {
-  Serial.print("GPRS init: ");
-  sendAT(F("E0"));
-  waitOK_ERROR();
-
-  sendAT(F("+SAPBR=3,1,\"Contype\",\"GPRS\""));
-  waitOK_ERROR();
-
-  sendAT(F("+SAPBR=3,1,\"APN\",\"" GPRS_APN "\""));
-  waitOK_ERROR();
-
-#ifdef GPRS_USER
-  sendAT(F("+SAPBR=3,1,\"USER\",\"" GPRS_USER "\""));
-  waitOK_ERROR();
-#endif
-#ifdef GPRS_PASSWORD
-  sendAT(F("+SAPBR=3,1,\"PWD\",\"" GPRS_PASSWORD "\""));
-  waitOK_ERROR();
-#endif
-
-  sendAT(F("+CGDCONT=1,\"IP\",\"" GPRS_APN "\""));
-  waitOK_ERROR();
-  return true;
-}
-//***********************************************************
-// Start the GSM connection
-bool gprsConnect() {
-  
-  Serial.println("Connecting to GSM...");
-
-  sendAT(F("+CGACT=1,1"));
-  waitOK_ERROR(60000L);
-
-  // Open a GPRS context
-  sendAT(F("+SAPBR=1,1"));
-  waitOK_ERROR(85000L);
-  // Query the GPRS context
-  sendAT(F("+SAPBR=2,1"));
-  if (waitOK_ERROR(30000L) != 1)
-    return false;
-
-  Serial.println("GSM connected");
-  return true;
-}
-//***********************************************************
-bool gprsDisconnect() {
-  sendAT(F("+SAPBR=0,1"));
-  if (waitOK_ERROR(30000L) != 1)
-    return;
-
-  sendAT(F("+CGACT=0"));
-  waitOK_ERROR(60000L);
-
-  Serial.println("GSM disconnected");
-  return true;
-}
-//***********************************************************
-int httpRequest(const String& method,
-                const String& url,
-                const String& request,
-                String&       response)
-{
-  Serial.print(F("  Request: "));
-  Serial.print(host);
-  Serial.println(url);
-
-  sendAT(F("+HTTPTERM"));
-  waitOK_ERROR();
-
-  sendAT(F("+HTTPINIT"));
-  waitOK_ERROR();
-
-  sendAT(F("+HTTPPARA=\"CID\",1"));
-  waitOK_ERROR();
-
-#ifdef USE_HTTPS
-  sendAT(F("+HTTPSSL=1"));
-  waitOK_ERROR();
-  sendAT(String(F("+HTTPPARA=\"URL\",\"https://")) + host + url + "\"");
-  waitOK_ERROR();
-#else
-  sendAT(String(F("+HTTPPARA=\"URL\",\"")) + host + url + "\"");
-  waitOK_ERROR();
-#endif
-
-  if (request.length()) {
-    sendAT(F("+HTTPPARA=\"CONTENT\",\"application/json\""));
-    waitOK_ERROR();
-    sendAT(String(F("+HTTPDATA=")) + request.length() + "," + 10000);
-    waitResponse(F("DOWNLOAD\r\n"));
-    stream1->print(request);
-    waitOK_ERROR();
-  }
-
-  if (method == "GET") {
-    sendAT(F("+HTTPACTION=0"));
-  } else if (method == "POST") {
-    sendAT(F("+HTTPACTION=1"));
-  } else if (method == "HEAD") {
-    sendAT(F("+HTTPACTION=2"));
-  } else if (method == "DELETE") {
-    sendAT(F("+HTTPACTION=3"));
-  }
-  waitOK_ERROR();
-
-  if (waitResponse(30000L, F("+HTTPACTION:")) != 1) {
-    Serial.println("HTTPACTION Timeout");
-    return false;
-  }
-  stream1->readStringUntil(',');
-  int code = stream1->readStringUntil(',').toInt();
-  size_t len = stream1->readStringUntil('\n').toInt();
-
-  if (code != 200) {
-    Serial.print("Error code:");
-    Serial.println(code);
-    sendAT(F("+HTTPTERM"));
-    waitOK_ERROR();
-    return false;
-  }
-
-  response = "";
-
-  if (len > 0) {
-    response.reserve(len);
-
-    sendAT(F("+HTTPREAD"));
-    if (waitResponse(10000L, F("+HTTPREAD: ")) != 1) {
-      Serial.println("HTTPREAD Timeout");
-      return false;
-    }
-    len = stream1->readStringUntil('\n').toInt();
-
-    while (len--) {
-      while (!stream1->available()) {
-        delay(1);
-      }
-      response += (char)(stream1->read());
-    }
-    waitOK_ERROR();
-  }
-
-  sendAT(F("+HTTPTERM"));
-  waitOK_ERROR();
-
-  return true;
 }
 //***********************************************************
